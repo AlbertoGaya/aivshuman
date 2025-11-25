@@ -1,0 +1,10 @@
+path: datasets  # Ruta relativa al directorio 'datasets'
+train: datasets/train    # Relativa a 'path', así que buscará datasets/train
+val: datasets/val      # Relativa a 'path', así que buscará datasets/val
+test: datasets/test    # Relativa a 'path', así que buscará datasets/test
+
+names:
+  0: blurry
+  1: good
+  2: no-laser
+  3: rov
