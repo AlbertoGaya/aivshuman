@@ -1,0 +1,251 @@
+import cv2
+import pandas as pd
+import math
+import os
+import traceback
+from ultralytics import YOLO
+import numpy as np
+
+# --- Funciones de Telemetría (sin cambios) ---
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371000
+    lat1_rad, lon1_rad, lat2_rad, lon2_rad = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    a = math.sin(dlat / 2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+def filter_coordinates(df):
+    selected_rows = []
+    group_counter = 1
+    group_size = 10
+    current_group = []
+
+    if df.empty:
+        return pd.DataFrame()
+
+    lat1, lon1 = float(df.iloc[0]['Lat_Rov']), float(df.iloc[0]['Lon_Rov'])
+    current_group.append(df.index[0])
+
+    for index, row in df.iloc[1:].iterrows():
+        lat2, lon2 = float(row['Lat_Rov']), float(row['Lon_Rov'])
+        distance = haversine(lat1, lon1, lat2, lon2)
+
+        if distance >= 1:
+            if len(current_group) >= group_size:
+                for i in current_group[:group_size]:
+                    selected_rows.append((i, group_counter))
+                group_counter += 1
+            current_group = [index]
+            lat1, lon1 = lat2, lon2
+        else:
+            current_group.append(index)
+
+    if len(current_group) >= group_size:
+        for i in current_group[:group_size]:
+            selected_rows.append((i, group_counter))
+
+    if not selected_rows:
+        print("No se seleccionaron filas basadas en el filtro de distancia.")
+        return pd.DataFrame()
+
+    indices = [index for index, group in selected_rows]
+    grupos = [group for index, group in selected_rows]
+    df_filtered = df.loc[indices].copy()
+    df_filtered['Grupo'] = grupos
+    return df_filtered
+
+def add_frame_column(df):
+    df['Frame'] = range(1, len(df) * 25 + 1, 25)
+    print("Columna 'Frame' agregada con éxito al DataFrame.")
+    return df
+
+def extract_frames(video_path, frame_indices, group_number):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error al abrir el video: {video_path}")
+        return []
+
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    output_folder_group = os.path.join(f"{video_name}_frames", f"grupo_{group_number}")
+    os.makedirs(output_folder_group, exist_ok=True)
+
+    extracted_paths = []
+    for frame_index in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index - 1)
+        ret, frame = cap.read()
+        if ret:
+            file_path = os.path.join(output_folder_group, f"{frame_index}.jpg")
+            cv2.imwrite(file_path, frame)
+            extracted_paths.append(file_path)
+    cap.release()
+    return extracted_paths
+
+# --- SECCIÓN DE PROCESAMIENTO DE IMAGEN ---
+
+def detectar_y_escalar_por_pixeles(image_path, params):
+    """
+    Detecta un par de láseres basado en reglas de píxeles, calcula la escala y el área total.
+    Esta función es la misma del script anterior, es más robusta.
+    """
+    img_cv = cv2.imread(image_path)
+    if img_cv is None:
+        print(f"Error: No se pudo cargar la imagen {image_path}")
+        return None, None, None
+
+    mask = cv2.inRange(img_cv, params['lower_bgr'], params['upper_bgr'])
+    coords_yx = np.argwhere(mask == 255)
+    coords_xy = [(int(coord[1]), int(coord[0])) for coord in coords_yx]
+
+    if len(coords_xy) < 2:
+        return img_cv, None, None
+
+    for i in range(len(coords_xy)):
+        for j in range(i + 1, len(coords_xy)):
+            p1, p2 = coords_xy[i], coords_xy[j]
+            
+            if abs(p1[1] - p2[1]) <= params['y_tolerance']:
+                dist_x = abs(p1[0] - p2[0])
+                if params['min_x_dist'] <= dist_x <= params['max_x_dist']:
+                    cm_per_pixel = params['real_dist_cm'] / dist_x
+                    alto, ancho, _ = img_cv.shape
+                    area_total_m2 = (alto * ancho * cm_per_pixel**2) / 10000
+                    
+                    return img_cv, cm_per_pixel, area_total_m2
+
+    return img_cv, None, None
+
+# --- FUNCIÓN NUEVA (traída del segundo script) ---
+def add_black_rectangle_to_image(image_array):
+    """
+    Añade un recuadro negro al 1/4 superior de una imagen.
+    """
+    img = image_array.copy()
+    height, width, _ = img.shape
+    rectangle_height = height // 4
+    # Dibuja un rectángulo negro relleno (thickness = -1)
+    cv2.rectangle(img, (0, 0), (width, rectangle_height), (0, 0, 0), -1)
+    return img
+
+def main():
+    # --- PARÁMETROS DE CONFIGURACIÓN ---
+    filename = input("Introduce el nombre del archivo de telemetria (ej: telemetria.csv): ")
+    video_path = input("Introduce la ruta completa del video (ej: /ruta/a/video.mp4): ")
+    
+    # Rutas de los modelos YOLO (ya no se usa segmentación)
+    classification_model_path = 'classify.pt'
+    detection_model_path = 'detection.pt'
+
+    # Parámetros para la detección de láser
+    laser_params = {
+        'lower_bgr': np.array([175, 240, 180]),
+        'upper_bgr': np.array([220, 255, 220]),
+        'y_tolerance': 50,
+        'min_x_dist': 50,
+        'max_x_dist': 500,
+        'real_dist_cm': 20.0
+    }
+
+    # --- 1. Cargar y procesar telemetría ---
+    try:
+        df = pd.read_csv(filename)
+        df_with_frame = add_frame_column(df)
+        df_filtered = filter_coordinates(df_with_frame)
+        if df_filtered.empty: return
+    except Exception as e:
+        print(f"Error al procesar la telemetría: {e}")
+        return
+
+    # --- 2. Cargar Modelos YOLO (Clasificación y Detección) ---
+    try:
+        classification_model = YOLO(classification_model_path)
+        detection_model = YOLO(detection_model_path)
+    except Exception as e:
+        print(f"Error al cargar modelos YOLO: {e}")
+        return
+
+    # --- 3. Procesamiento principal por grupos ---
+    output_images_folder = "imagenes_procesadas_good"
+    os.makedirs(output_images_folder, exist_ok=True)
+    
+    best_images_data = []
+    for group_number, group_df in df_filtered.groupby('Grupo'):
+        print(f"\n--- Procesando Grupo {group_number} ---")
+        
+        frame_indices = group_df['Frame'].tolist()
+        extracted_paths = extract_frames(video_path, frame_indices, group_number)
+        if not extracted_paths: continue
+
+        # --- Detección de láser y escalado ---
+        laser_detected_candidates = []
+        for image_path in extracted_paths:
+            original_img, cm_px, area_m2 = detectar_y_escalar_por_pixeles(image_path, laser_params)
+            
+            if cm_px is not None:
+                frame_index = int(os.path.splitext(os.path.basename(image_path))[0])
+                laser_detected_candidates.append({
+                    'frame_index': frame_index, 'original_img': original_img,
+                    'cm_per_pixel': cm_px, 'total_area_m2': area_m2
+                })
+
+        if not laser_detected_candidates:
+            print(f"Grupo {group_number}: No se detectaron láseres válidos.")
+            continue
+
+        # --- Clasificación y selección de la mejor imagen ---
+        good_candidates = []
+        for candidate in laser_detected_candidates:
+            results = classification_model.predict(candidate['original_img'], verbose=False)
+            if classification_model.names[results[0].probs.top1] == 'good':
+                candidate['confidence'] = results[0].probs.top1conf
+                good_candidates.append(candidate)
+        
+        if not good_candidates:
+            print(f"Grupo {group_number}: No se encontraron imágenes con clasificación 'good'.")
+            continue
+            
+        best_candidate = max(good_candidates, key=lambda x: x['confidence'])
+        
+        # --- MODIFICADO: Procesamiento final con rectángulo negro ---
+        bc = best_candidate
+        
+        # 1. Crear la imagen para detección añadiendo el rectángulo negro
+        img_for_detection = add_black_rectangle_to_image(bc['original_img'])
+        
+        # 2. Ejecutar la detección de objetos en la imagen con el rectángulo
+        detection_results = detection_model.predict(img_for_detection, verbose=False)
+        num_detections = len(detection_results[0].boxes)
+
+        # 3. Calcular el área visible y la densidad
+        # El área visible es ahora el 75% del área total previamente calculada.
+        visible_area_m2 = bc['total_area_m2'] * 0.75
+        density = num_detections / visible_area_m2 if visible_area_m2 > 0 else 0
+
+        # Almacenar resultados
+        original_row = df[df['Frame'] == bc['frame_index']].iloc[0]
+        best_images_data.append({
+            'Frame': bc['frame_index'], 'Confidence': bc['confidence'],
+            'NumDetections': num_detections, 'Density': density,
+            'Visible_Area_m2': visible_area_m2, 'Total_Area_m2': bc['total_area_m2'],
+            'Cm_Por_Pixel': bc['cm_per_pixel'], **original_row
+        })
+        
+        # Guardar la imagen procesada (la original, sin el rectángulo, para referencia)
+        output_image_path = os.path.join(output_images_folder, f"grupo_{group_number}_frame_{bc['frame_index']}.jpg")
+        cv2.imwrite(output_image_path, bc['original_img'])
+        print(f"✅ Grupo {group_number}: Mejor imagen (Frame {bc['frame_index']}) procesada y guardada.")
+
+
+    # --- 4. Guardar resultados finales ---
+    if best_images_data:
+        df_final = pd.DataFrame(best_images_data)
+        # Reordenar las columnas si es necesario
+        df_final.to_csv("results_final_recorte.csv", index=False)
+        print("\nProcesamiento completo. Resultados guardados en 'results_final_recorte.csv'")
+    else:
+        print("\nNo se procesó ninguna imagen con éxito.")
+
+
+if __name__ == "__main__":
+    main()
